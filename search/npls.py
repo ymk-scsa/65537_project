@@ -64,6 +64,8 @@ class NPLSPlayer:
         if sfen == "startpos":
             self.board = cshogi.Board()
         else:
+            if sfen.startswith("sfen "):
+                sfen = sfen[5:].strip()
             self.board.set_sfen(sfen)
         for m in moves:
             move = self.board.move_from_usi(m)
@@ -96,43 +98,44 @@ class NPLSPlayer:
     def go(self):
         self.stop_search = False
         start_time = time.time()
-        time_limit = self.think_time_ms / 1000.0
+        # わずかに短く切り、GUI 秒読み切れより先に返す
+        time_limit = max(self.think_time_ms / 1000.0, 0.05)
 
         root_sfen = self.board.sfen()
         root = NPLSNode(root_sfen)
 
-        # ルートのNN評価
-        policy, value = self._evaluate(root_sfen)
+        legal = list(self.board.legal_moves)
+        if not legal:
+            return "resign", None
+
+        try:
+            policy, value = self._evaluate(root_sfen)
+        except Exception as exc:
+            print(f"info string eval error: {exc}", flush=True)
+            return cshogi.move_to_usi(legal[0]), None
         root.v = value
 
-        # キューの初期化
         queue = []
-
-        # ルートの子ノードを作成してキューへ
         temp_board = cshogi.Board(sfen=root_sfen)
-        for move in temp_board.legal_moves:
+        for move in legal:
             usi_move = cshogi.move_to_usi(move)
             move_label = make_move_label(move, temp_board.turn)
-            p_val = policy[move_label]
+            p_val = float(policy[move_label]) if 0 <= move_label < len(policy) else 0.0
 
-            # 子局面の評価 (初期状態では親のValueを推定として使う)
             temp_board.push(move)
             child_sfen = temp_board.sfen()
             temp_board.pop()
 
             child = NPLSNode(child_sfen, move=usi_move, parent=root, p=p_val)
-            # 初期優先度の計算
-            child.priority = - (self.w1 * p_val + self.w2 * 0.0 + self.w3 * 1.0)
+            child.priority = -(self.w1 * p_val + self.w2 * 0.0 + self.w3 * 1.0)
             root.children[usi_move] = child
             heapq.heappush(queue, child)
 
         root.n = 1
 
-        # 探索ループ
         nodes_searched = 0
         while queue and not self.stop_search:
-            elapsed = time.time() - start_time
-            if elapsed >= time_limit:
+            if (time.time() - start_time) >= time_limit:
                 break
 
             node = heapq.heappop(queue)
@@ -146,25 +149,33 @@ class NPLSPlayer:
                 else:
                     node.v = 0.0
             else:
-                p_arr, val = self._evaluate(node.sfen)
+                if (time.time() - start_time) >= time_limit or self.stop_search:
+                    break
+                try:
+                    p_arr, val = self._evaluate(node.sfen)
+                except Exception as exc:
+                    print(f"info string eval error: {exc}", flush=True)
+                    break
                 node.v = val
 
                 for move in node_board.legal_moves:
+                    if self.stop_search or (time.time() - start_time) >= time_limit:
+                        break
                     usi_move = cshogi.move_to_usi(move)
                     move_label = make_move_label(move, node_board.turn)
-                    p_val = p_arr[move_label]
+                    p_val = float(p_arr[move_label]) if 0 <= move_label < len(p_arr) else 0.0
 
                     node_board.push(move)
                     child_sfen = node_board.sfen()
                     node_board.pop()
 
                     child = NPLSNode(child_sfen, move=usi_move, parent=node, p=p_val)
-                    # 優先度計算
-                    child.priority = - (self.w1 * p_val + self.w2 * val + self.w3 * (1.0 / (node.n + 1)))
+                    child.priority = -(
+                        self.w1 * p_val + self.w2 * val + self.w3 * (1.0 / (node.n + 1))
+                    )
                     node.children[usi_move] = child
                     heapq.heappush(queue, child)
 
-            # 逆伝搬の排除: 訪問回数のみ伝搬
             curr = node
             while curr is not None:
                 curr.n += 1
@@ -172,17 +183,21 @@ class NPLSPlayer:
 
             nodes_searched += 1
 
-        best_move = "resnet"
-        max_n = -1
+        # 訪問が無いときは policy 最大手を選ぶ（resign 事故防止）
+        best_move = None
         best_child = None
-
-        print(f"info string Searched {nodes_searched} nodes", flush=True)
-
+        max_n = -1
+        max_p = -1.0
         for usi_move, child in root.children.items():
-            if child.n > max_n:
+            if child.n > max_n or (child.n == max_n and child.p > max_p):
                 max_n = child.n
+                max_p = child.p
                 best_move = usi_move
                 best_child = child
+        if best_move is None:
+            best_move = cshogi.move_to_usi(legal[0])
+
+        print(f"info string Searched {nodes_searched} nodes", flush=True)
 
         ponder_move = None
         if best_child and best_child.children:
