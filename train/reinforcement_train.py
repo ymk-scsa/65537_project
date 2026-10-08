@@ -33,6 +33,7 @@ def self_play_game(player_black, player_white, max_moves=200):
     game_history = []  # (sfen, chosen_move_label, current_player_turn)
     
     move_count = 0
+    best_move_usi = None
     while not board.is_game_over() and move_count < max_moves:
         current_player = player_black if board.turn == cshogi.BLACK else player_white
         
@@ -45,7 +46,7 @@ def self_play_game(player_black, player_white, max_moves=200):
         current_player.set_limits(think_time_ms=50) # 高速動作のために思考時間を短く設定
         best_move_usi, _ = current_player.go()
         
-        if best_move_usi == "resign" or best_move_usi == "resnet":
+        if best_move_usi in ("resign", "resnet"):
             break
             
         move = board.move_from_usi(best_move_usi)
@@ -64,16 +65,15 @@ def self_play_game(player_black, player_white, max_moves=200):
         move_count += 1
 
     # 勝敗結果の反映
-    res = board.result()
-    # 手番から見た報酬を算出
+    # 手番から見た報酬を算出（Board.result() は cshogi に存在しないため自前で判定）
     reward_black = 0.5
     reward_white = 0.5
-    if res == "1-0":
-        reward_black = 1.0
-        reward_white = 0.0
-    elif res == "0-1":
-        reward_black = 0.0
-        reward_white = 1.0
+    if board.is_game_over() or best_move_usi in ("resign", "resnet"):
+        # 詰み・投了: その時点の手番側の負け
+        if board.turn == cshogi.BLACK:
+            reward_black, reward_white = 0.0, 1.0
+        else:
+            reward_black, reward_white = 1.0, 0.0
         
     training_data = []
     for feat, policy_target, turn in game_history:

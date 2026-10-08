@@ -127,13 +127,9 @@ class MCTSPlayer:
 
             # 2. Expansion & Evaluation
             if temp_board.is_game_over():
-                res = temp_board.result()
-                if res == "1-0":
-                    value = 1.0 if temp_board.turn == cshogi.BLACK else -1.0
-                elif res == "0-1":
-                    value = -1.0 if temp_board.turn == cshogi.BLACK else 1.0
-                else:
-                    value = 0.0
+                # cshogi の is_game_over() は「手番側に合法手がない」= 手番側の負け
+                # （Board.result() は cshogi に存在しないため使わない）
+                value = -1.0
             else:
                 policy, value = self._evaluate(temp_board.sfen())
                 # 子供を展開

@@ -111,9 +111,8 @@ def play_one_game(
             print(f"  {len(moves):3d}. {mark} {best_usi:8s} ({elapsed_ms:.0f} ms)")
 
     if board.is_game_over():
-        res = board.result()
-        if res in ("1-0", "0-1"):
-            return res, moves
+        # 手番側に合法手がない = 手番側の負け（Board.result() は cshogi に存在しない）
+        return ("0-1" if board.turn == cshogi.BLACK else "1-0"), moves
     return "draw", moves
 
 

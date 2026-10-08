@@ -141,13 +141,9 @@ class NPLSPlayer:
             node = heapq.heappop(queue)
             node_board = cshogi.Board(sfen=node.sfen)
             if node_board.is_game_over():
-                res = node_board.result()
-                if res == "1-0":
-                    node.v = 1.0 if node_board.turn == cshogi.BLACK else -1.0
-                elif res == "0-1":
-                    node.v = -1.0 if node_board.turn == cshogi.BLACK else 1.0
-                else:
-                    node.v = 0.0
+                # cshogi の is_game_over() は「手番側に合法手がない」= 手番側の負け
+                # （Board.result() は cshogi に存在しないため使わない）
+                node.v = -1.0
             else:
                 if (time.time() - start_time) >= time_limit or self.stop_search:
                     break
