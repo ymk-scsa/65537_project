@@ -11,6 +11,7 @@ import argparse
 import logging
 import os
 import shutil
+import signal
 import sys
 import time
 from pathlib import Path
@@ -109,53 +110,94 @@ def train(
     if test_loader is not None:
         logger.info("test positions = %s", len(test_loader))
 
-    for epoch in range(1, epochs + 1):
-        t0 = time.time()
-        model.train()
-        epoch_loss = 0.0
-        n_batches = 0
-        for features, policies, values in train_loader:
-            optimizer.zero_grad(set_to_none=True)
-            policy_out, value_out = model(features, return_aux=False)
-            loss = criterion_policy(policy_out, policies) + criterion_value(value_out, values)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-            n_batches += 1
-            if n_batches % 100 == 0:
-                logger.info(
-                    "  epoch %s batch %s/%s loss=%.4f",
-                    epoch,
-                    n_batches,
-                    max(len(train_loader) // batch_size, 1),
-                    loss.item(),
-                )
+    stop_requested = False
+    current_epoch = 0
 
-        avg = epoch_loss / max(n_batches, 1)
-        msg = f"Epoch {epoch}/{epochs} - train_loss: {avg:.4f} - time: {time.time() - t0:.1f}s"
+    def _handle_signal(signum, _frame) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+        logger.warning(
+            "Signal %s received — will save checkpoint after the current batch and exit",
+            signum,
+        )
 
-        if test_loader is not None:
-            model.eval()
-            test_loss = 0.0
-            test_batches = 0
-            with torch.no_grad():
-                for features, policies, values in test_loader:
-                    policy_out, value_out = model(features, return_aux=False)
-                    loss = criterion_policy(policy_out, policies) + criterion_value(value_out, values)
-                    test_loss += loss.item()
-                    test_batches += 1
-            msg += f" - test_loss: {test_loss / max(test_batches, 1):.4f}"
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
 
-        logger.info(msg)
+    try:
+        for epoch in range(1, epochs + 1):
+            current_epoch = epoch
+            t0 = time.time()
+            model.train()
+            epoch_loss = 0.0
+            n_batches = 0
+            for features, policies, values in train_loader:
+                optimizer.zero_grad(set_to_none=True)
+                policy_out, value_out = model(features, return_aux=False)
+                loss = criterion_policy(policy_out, policies) + criterion_value(value_out, values)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_batches += 1
+                if n_batches % 100 == 0:
+                    logger.info(
+                        "  epoch %s batch %s/%s loss=%.4f",
+                        epoch,
+                        n_batches,
+                        max(len(train_loader) // batch_size, 1),
+                        loss.item(),
+                    )
+                if stop_requested:
+                    logger.warning(
+                        "Interrupted at epoch %s batch %s — saving checkpoint",
+                        epoch,
+                        n_batches,
+                    )
+                    _save_weights(model, weights_path, backup=True)
+                    snap = weights_path.replace(
+                        ".pth", f"_interrupt_ep{epoch}_b{n_batches}.pth"
+                    )
+                    torch.save(model.state_dict(), snap)
+                    logger.info("Interrupt snapshot saved to %s", snap)
+                    return
 
-        if save_every > 0 and epoch % save_every == 0:
-            _save_weights(model, weights_path, backup=True)
-            snap = weights_path.replace(".pth", f"_ep{epoch}.pth")
-            if snap != weights_path:
-                torch.save(model.state_dict(), snap)
-                logger.info("Snapshot saved to %s", snap)
+            avg = epoch_loss / max(n_batches, 1)
+            msg = (
+                f"Epoch {epoch}/{epochs} - train_loss: {avg:.4f} "
+                f"- time: {time.time() - t0:.1f}s"
+            )
 
-    _save_weights(model, weights_path, backup=True)
+            if test_loader is not None:
+                model.eval()
+                test_loss = 0.0
+                test_batches = 0
+                with torch.no_grad():
+                    for features, policies, values in test_loader:
+                        policy_out, value_out = model(features, return_aux=False)
+                        loss = criterion_policy(policy_out, policies) + criterion_value(
+                            value_out, values
+                        )
+                        test_loss += loss.item()
+                        test_batches += 1
+                msg += f" - test_loss: {test_loss / max(test_batches, 1):.4f}"
+
+            logger.info(msg)
+
+            if save_every > 0 and epoch % save_every == 0:
+                _save_weights(model, weights_path, backup=True)
+                snap = weights_path.replace(".pth", f"_ep{epoch}.pth")
+                if snap != weights_path:
+                    torch.save(model.state_dict(), snap)
+                    logger.info("Snapshot saved to %s", snap)
+
+        _save_weights(model, weights_path, backup=True)
+    except KeyboardInterrupt:
+        logger.warning(
+            "KeyboardInterrupt at epoch %s — saving checkpoint",
+            current_epoch or "?",
+        )
+        _save_weights(model, weights_path, backup=True)
+        raise
 
 
 def _parse_args() -> argparse.Namespace:
