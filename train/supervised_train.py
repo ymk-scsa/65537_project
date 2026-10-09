@@ -42,6 +42,35 @@ def _load_weights(model: nn.Module, path: str, device: torch.device) -> bool:
     return True
 
 
+def _wdl_target(values: torch.Tensor, data_format: str) -> torch.Tensor:
+    """
+    価値ラベル（-1〜+1）から 勝ち/引き分け/負け の目標分布を作る（apple 系モデル用）。
+      hcpe: 対局結果 (+1/0/-1) → one-hot（0 は引き分け）
+      psv : 評価値由来の連続値 → 勝ち=(1+v)/2, 負け=(1-v)/2, 引き分け=0
+    """
+    v = values.view(-1)
+    if data_format == "hcpe":
+        win = (v > 0.5).float()
+        loss = (v < -0.5).float()
+        draw = 1.0 - win - loss
+    else:
+        win = (1.0 + v) * 0.5
+        loss = (1.0 - v) * 0.5
+        draw = torch.zeros_like(v)
+    return torch.stack([win, draw, loss], dim=1)
+
+
+def _compute_loss(model, features, policies, values, criterion_policy, criterion_value, data_format):
+    if getattr(model, "uses_turn", False):
+        # 手番別ヘッド（WDL）: 特徴量の 448 列目が手番
+        policy_out, wdl_logits = model.forward_wdl(features)
+        target = _wdl_target(values, data_format)
+        value_loss = -(target * torch.log_softmax(wdl_logits, dim=1)).sum(dim=1).mean()
+        return criterion_policy(policy_out, policies) + value_loss
+    policy_out, value_out = model(features, return_aux=False)
+    return criterion_policy(policy_out, policies) + criterion_value(value_out, values)
+
+
 def _save_weights(model: nn.Module, path: str, backup: bool = True) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     if backup and os.path.exists(path):
@@ -71,6 +100,7 @@ def train(
 
     model = create_model(num_actions=2187, mode=mode)
     model.to(device)
+    with_turn = bool(getattr(model, "uses_turn", False))
     if resume:
         _load_weights(model, weights_path, device)
 
@@ -80,15 +110,25 @@ def train(
 
     fmt = data_format.strip().lower()
     if fmt == "hcpe":
-        train_loader = HcpeDataLoader(train_data, batch_size, device, shuffle=True, limit=limit)
+        train_loader = HcpeDataLoader(
+            train_data, batch_size, device, shuffle=True, limit=limit, with_turn=with_turn
+        )
         test_loader = (
-            HcpeDataLoader(test_data, test_batch_size, device, shuffle=False, limit=limit)
+            HcpeDataLoader(
+                test_data, test_batch_size, device, shuffle=False, limit=limit, with_turn=with_turn
+            )
             if test_data
             else None
         )
     elif fmt == "psv":
         train_loader = PsvDataLoader(
-            train_data, batch_size, device, shuffle=True, limit=limit, score_scale=psv_score_scale
+            train_data,
+            batch_size,
+            device,
+            shuffle=True,
+            limit=limit,
+            score_scale=psv_score_scale,
+            with_turn=with_turn,
         )
         test_loader = (
             PsvDataLoader(
@@ -98,6 +138,7 @@ def train(
                 shuffle=False,
                 limit=limit,
                 score_scale=psv_score_scale,
+                with_turn=with_turn,
             )
             if test_data
             else None
@@ -116,8 +157,9 @@ def train(
         n_batches = 0
         for features, policies, values in train_loader:
             optimizer.zero_grad(set_to_none=True)
-            policy_out, value_out = model(features, return_aux=False)
-            loss = criterion_policy(policy_out, policies) + criterion_value(value_out, values)
+            loss = _compute_loss(
+                model, features, policies, values, criterion_policy, criterion_value, fmt
+            )
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
@@ -140,8 +182,9 @@ def train(
             test_batches = 0
             with torch.no_grad():
                 for features, policies, values in test_loader:
-                    policy_out, value_out = model(features, return_aux=False)
-                    loss = criterion_policy(policy_out, policies) + criterion_value(value_out, values)
+                    loss = _compute_loss(
+                        model, features, policies, values, criterion_policy, criterion_value, fmt
+                    )
                     test_loss += loss.item()
                     test_batches += 1
             msg += f" - test_loss: {test_loss / max(test_batches, 1):.4f}"

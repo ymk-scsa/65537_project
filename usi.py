@@ -42,6 +42,9 @@ class TournamentConfig:
         self.impasse_value = impasse_value
         self.max_moves = max_moves
         self.use_search = use_search
+        # "classic": これまでの決め方 / "denryu": 1秒未満切り捨て＋加算を使う決め方
+        self.time_mode = "classic"
+        self.margin_ms = 400
 
     def calc_think_time_ms(
         self,
@@ -174,6 +177,32 @@ def _apply_option(config: TournamentConfig, name: str, value: str) -> None:
         pass
 
 
+def denryu_think_time_ms(
+    remaining: int, inc: int, byoyomi: int, ply: int, max_moves: int = 512, margin: int = 400
+) -> int:
+    """
+    電竜戦向けの思考時間（search/cpp/src/time_manager.hpp と同じ計算）。
+
+    1手の消費時間は 1秒未満切り捨て → 思考時間を「k 秒 + (1000 - margin) ミリ秒」にそろえる。
+    加算 2秒なら 2.6秒考えても消費は 2秒で、すぐ 2秒戻るので持ち時間は減らない。
+    """
+    margin = max(margin, 0)
+    own_left = max(1, (max_moves - ply) // 2)
+    est = min(max(own_left, 1), 60 if remaining < 30000 else 40)
+    frac = 1000 - min(margin, 900)
+    if inc > 0:
+        target = inc + frac + remaining // est
+    elif byoyomi > 0:
+        target = byoyomi - margin + remaining // est
+    else:
+        target = frac + remaining // (est + 10)
+    if inc + remaining > 0:
+        k = max(0, (target - frac) // 1000)
+        target = k * 1000 + frac
+        target = min(target, (remaining // 1000) * 1000 + frac)
+    return max(int(target), 100)
+
+
 def _inject_think_time(player: Player, config: TournamentConfig, kwargs: dict) -> None:
     import cshogi
 
@@ -201,7 +230,13 @@ def _inject_think_time(player: Player, config: TournamentConfig, kwargs: dict) -
 
     remaining_ms = kwargs.get("btime" if turn == cshogi.BLACK else "wtime", 0)
     byoyomi_ms = kwargs.get("byoyomi", 0)
-    remaining_ms += kwargs.get("binc" if turn == cshogi.BLACK else "winc", 0)
+    inc_ms = kwargs.get("binc" if turn == cshogi.BLACK else "winc", 0)
+    if getattr(config, "time_mode", "classic") == "denryu":
+        kwargs["think_time_ms"] = denryu_think_time_ms(
+            remaining_ms, inc_ms, byoyomi_ms, current_move, config.max_moves, config.margin_ms
+        )
+        return
+    remaining_ms += inc_ms
 
     moves_left = config.moves_left_estimate(current_move)
     think = config.calc_think_time_ms(remaining_ms, byoyomi_ms, moves_left)
@@ -363,6 +398,20 @@ def build_player(args: argparse.Namespace) -> Player:
         blocks_config_mode=args.mode,
         modelfile=args.weights,
     )
+    if args.search_type in ("mcts_cpp", "npls_cpp"):
+        # C++ 探索 + PyTorch 推論（search/cpp_player.py）
+        from search.cpp_player import CppSearchPlayer
+
+        algo = args.search_type.split("_")[0]
+        return CppSearchPlayer(
+            algo=algo,
+            **common,
+            name=f"{args.name} ({algo.upper()}-C++)",
+            batch_size=args.batch_size,
+            threads=args.threads,
+            draw_value_black=args.draw_black,
+            draw_value_white=args.draw_white,
+        )
     if args.search_type == "npls":
         return NPLSPlayer(**common, name=args.name + " (NPLS)")
     if args.search_type == "mc_rzf":
@@ -378,7 +427,24 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--mode", type=str, default="modelC")
     p.add_argument("--weights", type=str, default="weights/checkpoint.pth")
     p.add_argument("--name", type=str, default="GNN-Shogi")
-    p.add_argument("--search_type", type=str, default="npls", choices=["mcts", "npls", "mc_rzf"])
+    p.add_argument(
+        "--search_type",
+        type=str,
+        default="npls",
+        choices=["mcts", "npls", "mc_rzf", "mcts_cpp", "npls_cpp"],
+        help="*_cpp は C++ 探索（先に bash search/cpp/build.sh が必要）",
+    )
+    p.add_argument("--batch_size", type=int, default=32, help="C++ 探索で NN にまとめて渡す局面数")
+    p.add_argument("--threads", type=int, default=0, help="PyTorch の CPU スレッド数（0=自動）")
+    p.add_argument(
+        "--time_mode",
+        choices=["classic", "denryu"],
+        default="classic",
+        help="denryu = 1秒未満切り捨て＋加算を使う時間の決め方（電竜戦向け）",
+    )
+    p.add_argument("--margin_ms", type=int, default=400, help="denryu で残す通信遅延の余裕(ms)")
+    p.add_argument("--draw_black", type=float, default=0.4, help="先手の引き分けの勝ち点（電竜戦 0.4）")
+    p.add_argument("--draw_white", type=float, default=0.6, help="後手の引き分けの勝ち点（電竜戦 0.6）")
     p.add_argument("--time_rate", type=float, default=0.5)
     p.add_argument("--draw_value", type=int, default=0)
     p.add_argument("--impasse_score", type=int, default=28)
@@ -405,6 +471,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         max_moves=args.max_moves,
         use_search=bool(args.use_search),
     )
+    config.time_mode = args.time_mode
+    config.margin_ms = args.margin_ms
     player = build_player(args)
     run(player, config)
 

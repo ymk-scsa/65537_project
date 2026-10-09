@@ -4,6 +4,9 @@ CNN / GNN / Transformer などを組み合わせたハイブリッド評価関�
 
 盤面は **447bit**（盤面 405bit + 持ち駒 42bit）に圧縮し、埋め込み後に Policy / Value を出力します。
 
+> **apple_branch の追加内容**（RayGraph ハイブリッドモデル・先手/後手別の評価・C++ 探索・高速化）は
+> [`APPLE.md`](APPLE.md) にまとめています。
+
 ## 必要条件
 
 - WSL2 + **Ubuntu-22.04**
@@ -49,12 +52,15 @@ Docker を使う場合は `settings/Dockerfile` を参照してください。
 │   ├── gnn_block.py        # GNN 系ブロック
 │   ├── transformer_block.py
 │   ├── others_block.py     # 軽量・特殊ブロック
+│   ├── apple_net.py        # RayGraph ハイブリッド（appleXS / appleS / appleM）
 │   └── model_README.md
 ├── search/
 │   ├── mcts.py             # モンテカルロ木探索
 │   ├── npls.py             # UW-NPLS（推奨）
 │   ├── mc_rzf.py           # MC-RZF（実験）
-│   └── spsa.py             # 探索ハイパーパラメータ最適化
+│   ├── spsa.py             # 探索ハイパーパラメータ最適化
+│   ├── cpp_player.py       # C++ 探索 + PyTorch 推論（mcts_cpp / npls_cpp）
+│   └── cpp/                # C++ 版の探索・USI エンジン（APPLE.md 参照）
 ├── play/
 │   └── match.py            # エンジン同士の対局（学習とは独立）
 ├── train/

@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 weights/*.pth
 train_data/
+search/cpp/build/
+search/cpp/*.so
+search/cpp/apple_engine
+weights/*.ts

@@ -87,7 +87,12 @@ class MCTSPlayer:
         feat_tensor = torch.tensor(feat, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         with torch.no_grad():
-            policy_logits, value_tensor = self.model(feat_tensor, return_aux=False)
+            if getattr(self.model, "uses_turn", False):
+                # apple 系モデル: 手番別ヘッドを使うので手番を渡す
+                turn_t = torch.tensor([b.turn], dtype=torch.long, device=self.device)
+                policy_logits, value_tensor = self.model(feat_tensor, turn=turn_t)
+            else:
+                policy_logits, value_tensor = self.model(feat_tensor, return_aux=False)
             policy = torch.softmax(policy_logits, dim=-1).cpu().numpy()[0]
             value = value_tensor.cpu().numpy()[0][0]
 
@@ -145,7 +150,9 @@ class MCTSPlayer:
                     curr.children[usi_move] = MCTSNode(child_sfen, move=usi_move, parent=curr, p=p_val)
 
             # 3. Backpropagation
-            v = value
+            # value は葉の局面の手番側から見た値。親が子を選ぶときは
+            # 「その手を指した側（＝葉の手番の相手）」から見た値が必要なので符号を反転して始める。
+            v = -value
             node = curr
             while node is not None:
                 node.n += 1

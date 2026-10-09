@@ -21,6 +21,17 @@ from game.board import TOTAL_BITS, bit447_to_numpy, make_move_label, make_result
 
 logger = logging.getLogger(__name__)
 
+# C++ 版の特徴量作成（search/cpp をビルド済みなら使う。なければ Python 版）
+try:
+    import sys as _sys
+
+    _CPP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "search", "cpp")
+    if _CPP_DIR not in _sys.path:
+        _sys.path.insert(0, _CPP_DIR)
+    import apple_search_cpp as _cpp  # type: ignore
+except ImportError:
+    _cpp = None
+
 
 def _to_tanh_value(result_01: float) -> float:
     """勝敗ラベル [0, 1] を Value head（Tanh）向けの [-1, 1] に変換する。"""
@@ -52,8 +63,12 @@ class HcpeDataLoader:
         device: torch.device,
         shuffle: bool = False,
         limit: Optional[int] = None,
+        with_turn: bool = False,
     ) -> None:
         self.batch_size = batch_size
+        # with_turn=True のとき特徴量の 448 列目に手番（0=先手, 1=後手）を入れる（apple 系モデル用）
+        self.with_turn = with_turn
+        self.n_features = TOTAL_BITS + (1 if with_turn else 0)
         self.device = device
         self.shuffle = shuffle
         self.limit = limit
@@ -61,7 +76,7 @@ class HcpeDataLoader:
 
         pin = device.type != "cpu"
         self.torch_features = torch.empty(
-            (batch_size, TOTAL_BITS),
+            (batch_size, self.n_features),
             dtype=torch.float32,
             pin_memory=pin,
         )
@@ -96,10 +111,29 @@ class HcpeDataLoader:
                 np.random.shuffle(self.data)
             self.data = self.data[: self.limit]
 
+    def _mini_batch_cpp(self, hcpevec: np.ndarray) -> None:
+        """C++ で特徴量とラベルをまとめて作る（Python 版の数十倍速い）。"""
+        n = len(hcpevec)
+        feats, labels, turns = _cpp.hcpe_batch(
+            np.ascontiguousarray(hcpevec["hcp"]),
+            np.ascontiguousarray(hcpevec["bestMove16"], dtype=np.uint16),
+            self.with_turn,
+        )
+        self.features[:n] = feats
+        self.move_label[:n] = labels
+        gr = hcpevec["gameResult"].astype(np.int64)  # 0=引き分け, 1=先手勝ち, 2=後手勝ち
+        win = ((gr == 1) & (turns == BLACK)) | ((gr == 2) & (turns != BLACK))
+        res01 = np.where(gr == 0, 0.5, np.where(win, 1.0, 0.0))
+        self.result[:n] = res01 * 2.0 - 1.0
+
     def mini_batch(self, hcpevec: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        for i, hcpe in enumerate(hcpevec):
+        if _cpp is not None:
+            self._mini_batch_cpp(hcpevec)
+        for i, hcpe in enumerate(hcpevec if _cpp is None else []):
             self.board.set_hcp(hcpe["hcp"])
-            self.features[i] = bit447_to_numpy(self.board)
+            self.features[i, :TOTAL_BITS] = bit447_to_numpy(self.board)
+            if self.with_turn:
+                self.features[i, TOTAL_BITS] = float(self.board.turn)
             self.move_label[i] = make_move_label(int(hcpe["bestMove16"]), self.board.turn)
             self.result[i] = _to_tanh_value(make_result(int(hcpe["gameResult"]), self.board.turn))
 
@@ -157,7 +191,10 @@ class PsvDataLoader:
         shuffle: bool = False,
         limit: Optional[int] = None,
         score_scale: float = 600.0,
+        with_turn: bool = False,
     ) -> None:
+        self.with_turn = with_turn
+        self.n_features = TOTAL_BITS + (1 if with_turn else 0)
         self.batch_size = batch_size
         self.device = device
         self.shuffle = shuffle
@@ -167,7 +204,7 @@ class PsvDataLoader:
 
         pin = device.type != "cpu"
         self.torch_features = torch.empty(
-            (batch_size, TOTAL_BITS),
+            (batch_size, self.n_features),
             dtype=torch.float32,
             pin_memory=pin,
         )
@@ -205,7 +242,9 @@ class PsvDataLoader:
     def mini_batch(self, psvvec: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         for i, psv in enumerate(psvvec):
             self.board.set_psfen(psv["sfen"])
-            self.features[i] = bit447_to_numpy(self.board)
+            self.features[i, :TOTAL_BITS] = bit447_to_numpy(self.board)
+            if self.with_turn:
+                self.features[i, TOTAL_BITS] = float(self.board.turn)
             move16 = move16_from_psv(int(psv["move"]))
             self.move_label[i] = make_move_label(move16, self.board.turn)
             self.result[i] = _psv_score_to_value(psv["score"], self.board.turn, self.score_scale)

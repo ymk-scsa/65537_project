@@ -202,7 +202,12 @@ def create_model(num_actions, mode="modelA"):
 
     対応モード: modelA / modelB / modelC / modelD / modelE /
                 modelF / modelG / modelH / fastA
+                appleXS / appleS / appleM（RayGraph ハイブリッド + 手番別ヘッド。model/apple_net.py）
     """
+    if mode.startswith("apple"):
+        from .apple_net import create_apple_model
+        return create_apple_model(mode, num_actions=num_actions)
+
     if mode == "modelA":
         # 軽量ベースライン: ResBlock 10ブロック
         config = ['CRE'] * 10

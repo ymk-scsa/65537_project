@@ -89,7 +89,12 @@ class NPLSPlayer:
         feat_tensor = torch.tensor(feat, dtype=torch.float32, device=self.device).unsqueeze(0)  # (1, 447)
 
         with torch.no_grad():
-            policy_logits, value_tensor = self.model(feat_tensor, return_aux=False)
+            if getattr(self.model, "uses_turn", False):
+                # apple 系モデル: 手番別ヘッドを使うので手番を渡す
+                turn_t = torch.tensor([b.turn], dtype=torch.long, device=self.device)
+                policy_logits, value_tensor = self.model(feat_tensor, turn=turn_t)
+            else:
+                policy_logits, value_tensor = self.model(feat_tensor, return_aux=False)
             policy = torch.softmax(policy_logits, dim=-1).cpu().numpy()[0]
             value = value_tensor.cpu().numpy()[0][0]
 

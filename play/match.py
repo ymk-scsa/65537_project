@@ -44,6 +44,10 @@ def build_player(cfg: SideConfig) -> Player:
         name=cfg.name,
     )
     st = cfg.search_type.lower()
+    if st in ("mcts_cpp", "npls_cpp"):
+        from search.cpp_player import CppSearchPlayer
+
+        return CppSearchPlayer(algo=st.split("_")[0], **common)
     if st == "npls":
         return NPLSPlayer(**common)
     if st == "mc_rzf":
@@ -244,12 +248,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--quiet", action="store_true")
 
     p.add_argument("--black_name", default="GNN-Black")
-    p.add_argument("--black_search", default="npls", choices=["mcts", "npls", "mc_rzf"])
+    p.add_argument("--black_search", default="npls", choices=["mcts", "npls", "mc_rzf", "mcts_cpp", "npls_cpp"])
     p.add_argument("--black_mode", default="modelC")
     p.add_argument("--black_weights", default="weights/checkpoint.pth")
 
     p.add_argument("--white_name", default="GNN-White")
-    p.add_argument("--white_search", default="npls", choices=["mcts", "npls", "mc_rzf"])
+    p.add_argument("--white_search", default="npls", choices=["mcts", "npls", "mc_rzf", "mcts_cpp", "npls_cpp"])
     p.add_argument("--white_mode", default="modelC")
     p.add_argument("--white_weights", default="weights/checkpoint.pth")
 

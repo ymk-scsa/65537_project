@@ -9,3 +9,6 @@
 
 numpy>=1.26.0
 cshogi>=1.0.0
+
+# C++ 探索（search/cpp）をビルドする場合のみ必要
+# pybind11>=2.10
