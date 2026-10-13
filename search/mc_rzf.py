@@ -50,6 +50,8 @@ class MCRZFPlayer:
         if sfen == "startpos":
             self.board = cshogi.Board()
         else:
+            if sfen.startswith("sfen "):
+                sfen = sfen[5:].strip()
             self.board.set_sfen(sfen)
         for m in moves:
             move = self.board.move_from_usi(m)

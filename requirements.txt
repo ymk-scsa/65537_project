@@ -1,0 +1,11 @@
+# Third-party packages used across main / game / model / search / train.
+# (stdlib modules are omitted)
+#
+# Note:
+#   - GPU 版 torch が必要な場合は https://pytorch.org の手順に従って別途インストールしてください。
+#   - cshogi は Python バージョンごとに numpy の上限/下限を持つため、
+#     同一コマンドでまとめてインストールしてください。
+# pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+
+numpy>=1.26.0
+cshogi>=1.0.0
