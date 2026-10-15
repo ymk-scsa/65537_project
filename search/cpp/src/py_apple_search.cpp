@@ -132,6 +132,19 @@ static int move_label_from_usi(const std::string& sfen, const std::string& usi) 
     return make_move_label(m, pos.turn());
 }
 
+// 合法手の方策ラベル一覧（legal_all=true で LegalAll、false で Legal）。GPU 版合法手生成の確認用
+static std::vector<int> legal_move_labels(const std::string& sfen, bool legal_all) {
+    init_tables();
+    Position pos(sfen);
+    std::vector<int> out;
+    if (legal_all) {
+        for (MoveList<LegalAll> ml(pos); !ml.end(); ++ml) out.push_back(make_move_label(ml.move(), pos.turn()));
+    } else {
+        for (MoveList<Legal> ml(pos); !ml.end(); ++ml) out.push_back(make_move_label(ml.move(), pos.turn()));
+    }
+    return out;
+}
+
 PYBIND11_MODULE(apple_search_cpp, mod) {
     mod.doc() = "C++ 版の探索（MCTS / NPLS）と特徴量作成";
     init_tables();
@@ -166,6 +179,7 @@ PYBIND11_MODULE(apple_search_cpp, mod) {
             "HCPE の hcp(N,32) と bestMove16(N) から (特徴量, 指し手ラベル, 手番) を作る");
     mod.def("features_from_sfen", &features_from_sfen);
     mod.def("move_label_from_usi", &move_label_from_usi);
+    mod.def("legal_move_labels", &legal_move_labels, py::arg("sfen"), py::arg("legal_all") = true);
     mod.attr("NUM_FEATURES") = kFeatures;
     mod.attr("NUM_LABELS") = kLabels;
 }

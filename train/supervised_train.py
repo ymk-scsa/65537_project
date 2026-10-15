@@ -60,14 +60,31 @@ def _wdl_target(values: torch.Tensor, data_format: str) -> torch.Tensor:
     return torch.stack([win, draw, loss], dim=1)
 
 
-def _compute_loss(model, features, policies, values, criterion_policy, criterion_value, data_format):
+def _mask_illegal(policy_out, features):
+    """
+    合法でない手の方策を学習の対象から外す（ソフトマックスを合法手だけで取る）。
+    合法手はビットボード演算でバッチごとに作る（GPU で学習するときは GPU 上で計算される）。
+    """
+    from game.gpu_bitboard import legal_move_mask_bb
+
+    with torch.no_grad():
+        legal = legal_move_mask_bb(features[:, :447])
+    return policy_out.masked_fill(~legal, -1e4)
+
+
+def _compute_loss(model, features, policies, values, criterion_policy, criterion_value, data_format,
+                  mask_illegal=False):
     if getattr(model, "uses_turn", False):
         # 手番別ヘッド（WDL）: 特徴量の 448 列目が手番
         policy_out, wdl_logits = model.forward_wdl(features)
+        if mask_illegal:
+            policy_out = _mask_illegal(policy_out, features)
         target = _wdl_target(values, data_format)
         value_loss = -(target * torch.log_softmax(wdl_logits, dim=1)).sum(dim=1).mean()
         return criterion_policy(policy_out, policies) + value_loss
     policy_out, value_out = model(features, return_aux=False)
+    if mask_illegal:
+        policy_out = _mask_illegal(policy_out, features)
     return criterion_policy(policy_out, policies) + criterion_value(value_out, values)
 
 
@@ -94,6 +111,7 @@ def train(
     resume: bool = True,
     save_every: int = 1,
     psv_score_scale: float = 600.0,
+    mask_illegal: bool = False,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("device=%s mode=%s format=%s resume=%s", device, mode, data_format, resume)
@@ -158,7 +176,7 @@ def train(
         for features, policies, values in train_loader:
             optimizer.zero_grad(set_to_none=True)
             loss = _compute_loss(
-                model, features, policies, values, criterion_policy, criterion_value, fmt
+                model, features, policies, values, criterion_policy, criterion_value, fmt, mask_illegal
             )
             loss.backward()
             optimizer.step()
@@ -183,7 +201,8 @@ def train(
             with torch.no_grad():
                 for features, policies, values in test_loader:
                     loss = _compute_loss(
-                        model, features, policies, values, criterion_policy, criterion_value, fmt
+                        model, features, policies, values, criterion_policy, criterion_value, fmt,
+                        mask_illegal,
                     )
                     test_loss += loss.item()
                     test_batches += 1
@@ -226,6 +245,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--resume", type=int, default=1, choices=[0, 1], help="1=load existing weights")
     p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
     p.add_argument("--psv_score_scale", type=float, default=600.0)
+    p.add_argument(
+        "--mask_illegal",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="1=合法でない手を方策の学習から外す（合法手は game/gpu_bitboard.py で作る）",
+    )
     return p.parse_args()
 
 
@@ -246,4 +272,5 @@ if __name__ == "__main__":
         resume=bool(args.resume),
         save_every=args.save_every,
         psv_score_scale=args.psv_score_scale,
+        mask_illegal=bool(args.mask_illegal),
     )
