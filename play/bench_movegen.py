@@ -1,13 +1,21 @@
 """
 play/bench_movegen.py
-合法手生成の「正しさ」と「速さ」を確かめる（CPU の cshogi と、GPU 向けのビットボード版）。
+合法手生成の「正しさ」と「速さ」を確かめる。
 
     python play/bench_movegen.py                       # CPU だけ
     python play/bench_movegen.py --device cuda         # GPU で測る
-    python play/bench_movegen.py --device cuda --compile   # torch.compile でカーネルをまとめた版も測る
+    python play/bench_movegen.py --device cuda --compile   # torch.compile 版も測る
 
-  1. ランダムな対局の局面で、ビットボード版が cshogi の合法手と完全に一致するか確認する
-  2. 1秒あたりに何局面ぶん合法手を作れるかを比べる
+比べるもの:
+  - cshogi（CPU、1 局面ずつ）
+  - マス単位版（game/gpu_movegen.py。バッチが小さいとき）
+  - ビットボード版（game/gpu_bitboard.py）
+  - フラット版（game/gpu_bitboard_flat.py）
+  - 駒リスト版（game/gpu_movelist.py。CUDA の Triton カーネル）
+
+--compile のとき、ビットボード版とフラット版は torch.compile する。
+駒リスト版は最初から Triton カーネルなので、compile の有無で変わらない。
+大きいバッチでは mode=default を使う（max-autotune は MSVC が無いと CPU カーネル生成で落ちる）。
 """
 
 from __future__ import annotations
@@ -30,6 +38,7 @@ sys.path.insert(0, os.path.join(_ROOT, "search", "cpp"))
 
 from game.board import bit447_to_numpy, make_move_label  # noqa: E402
 from game.gpu_bitboard import legal_move_mask_bb, make_compiled_core_bb  # noqa: E402
+from game.gpu_bitboard_flat import legal_move_mask_flat, make_compiled_core_flat  # noqa: E402
 from game.gpu_movegen import legal_move_mask  # noqa: E402
 
 
@@ -64,6 +73,7 @@ def sync(device):
 
 
 def bench(fn, x, device, reps=5):
+    """1 回ならしてから、reps 回の平均秒数を返す。ならしにはコンパイル時間も入る。"""
     fn(x)
     sync(device)
     t = time.perf_counter()
@@ -71,6 +81,14 @@ def bench(fn, x, device, reps=5):
         fn(x)
     sync(device)
     return (time.perf_counter() - t) / reps
+
+
+def n_mismatch(mask, boards) -> int:
+    """マスクの合法手集合が、cshogi の LegalAll と違う局面の数。"""
+    return sum(
+        set(torch.nonzero(mask[i]).flatten().tolist()) != {make_move_label(mv, b.turn) for mv in b.legal_moves}
+        for i, b in enumerate(boards)
+    )
 
 
 def main() -> None:
@@ -81,6 +99,8 @@ def main() -> None:
     ap.add_argument("--batches", nargs="*", type=int, default=[256, 4096, 32768, 131072])
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--compile", action="store_true", help="torch.compile 版も測る（GPU 向け）")
+    ap.add_argument("--compile-mode", default="default",
+                    help="torch.compile の mode。大きいバッチは default（max-autotune は cl が要ることがある）")
     a = ap.parse_args()
     if a.threads > 0:
         torch.set_num_threads(a.threads)
@@ -95,14 +115,15 @@ def main() -> None:
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    # 1. 正しさ
+    # 1. 正しさ（cshogi の LegalAll。all_moves=True がこれと一致する）
     m = min(a.check, len(boards))
-    mask = legal_move_mask_bb(feats[:m].to(device)).cpu()
-    bad = sum(
-        set(torch.nonzero(mask[i]).flatten().tolist()) != {make_move_label(mv, b.turn) for mv in b.legal_moves}
-        for i, b in enumerate(boards[:m])
-    )
-    print(f"[正しさ] cshogi との不一致: {bad} / {m} 局面")
+    sample = feats[:m].to(device)
+    checked = boards[:m]
+    print(f"[正しさ] ビットボード版 不一致 {n_mismatch(legal_move_mask_bb(sample).cpu(), checked)} / {m}")
+    print(f"[正しさ] フラット版     不一致 {n_mismatch(legal_move_mask_flat(sample).cpu(), checked)} / {m}")
+    if device.type == "cuda":
+        from game.gpu_movelist import legal_move_mask_list
+        print(f"[正しさ] 駒リスト版     不一致 {n_mismatch(legal_move_mask_list(sample).cpu(), checked)} / {m}")
 
     # 2. 速さ（CPU 側の基準）
     t = time.perf_counter()
@@ -115,20 +136,29 @@ def main() -> None:
     print(f"[CPU] cshogi + 方策ラベル化（Python）         {len(boards) / (time.perf_counter() - t):>12,.0f} 局面/秒")
     print("      参考: cshogi の C++ を直接使うと 1 コアで約 90 万局面/秒（ラベル化込み、こちらで測定）")
 
-    core = make_compiled_core_bb() if a.compile else None
+    core_bb = make_compiled_core_bb(a.compile_mode) if a.compile else None
+    core_flat = make_compiled_core_flat(a.compile_mode) if a.compile else None
+    list_fn = None
+    if device.type == "cuda":
+        from game.gpu_movelist import legal_move_mask_list
+        list_fn = legal_move_mask_list
     for bs in a.batches:
         reps = bs // len(sfens) + 1
         x = feats.repeat(reps, 1)[:bs].to(device)
-        dt = bench(lambda z: legal_move_mask_bb(z), x, device)
-        line = f"[{device.type.upper()}] ビットボード版 batch={bs:<7}           {bs / dt:>12,.0f} 局面/秒（{dt * 1000:.1f} ms）"
+        jobs = [("ビットボード版", lambda z: legal_move_mask_bb(z))]
+        if core_bb is not None:
+            jobs.append(("ビットボード版 + compile", lambda z, c=core_bb: legal_move_mask_bb(z, core=c)))
+        jobs.append(("フラット版", lambda z: legal_move_mask_flat(z)))
+        if core_flat is not None:
+            jobs.append(("フラット版 + compile", lambda z, c=core_flat: legal_move_mask_flat(z, core=c)))
+        if list_fn is not None:
+            jobs.append(("駒リスト版", list_fn))
         if bs <= 8192:
-            dt2 = bench(lambda z: legal_move_mask(z), x, device)
-            line += f"  / マス単位版 {bs / dt2:,.0f}"
-        print(line, flush=True)
-        if core is not None:
-            dt3 = bench(lambda z: legal_move_mask_bb(z, core=core), x, device)
-            print(f"       ビットボード版 + torch.compile          {bs / dt3:>12,.0f} 局面/秒（{dt3 * 1000:.1f} ms）",
-                  flush=True)
+            jobs.append(("マス単位版", lambda z: legal_move_mask(z)))
+        print(f"[{device.type.upper()}] batch={bs}", flush=True)
+        for name, fn in jobs:
+            dt = bench(fn, x, device)
+            print(f"       {name:<24} {bs / dt:>12,.0f} 局面/秒（{dt * 1000:.1f} ms）", flush=True)
 
 
 if __name__ == "__main__":
